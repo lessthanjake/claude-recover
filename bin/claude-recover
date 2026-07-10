@@ -7,6 +7,8 @@ Usage:
   claude-recover --days 2 3   Only consider sessions from the last 2 days
   claude-recover --exclude ID Skip a session (id prefix ok, repeatable) — e.g. the
                               session you're currently in
+  claude-recover --crazy 3    Reopen with --dangerously-skip-permissions (no
+                              permission prompts — use with care)
 """
 
 import argparse
@@ -87,8 +89,9 @@ def find_sessions(days, excludes):
     return sessions
 
 
-def open_in_terminal(cwd, session_id):
-    cmd = f"cd {json.dumps(cwd)} && claude --resume {session_id}"
+def open_in_terminal(cwd, session_id, crazy=False):
+    flags = "--dangerously-skip-permissions " if crazy else ""
+    cmd = f"cd {json.dumps(cwd)} && claude {flags}--resume {session_id}"
     if os.environ.get("TERM_PROGRAM") == "iTerm.app" or Path("/Applications/iTerm.app").exists():
         script = f'''
         tell application "iTerm"
@@ -113,6 +116,9 @@ def main():
     ap.add_argument("--exclude", action="append", default=[], metavar="ID",
                     help="session id (prefix ok) to skip; repeatable")
     ap.add_argument("--max", type=int, default=10, help="max sessions to list (default 10)")
+    ap.add_argument("--crazy", action="store_true",
+                    help="resume with --dangerously-skip-permissions "
+                         "(no permission prompts — use with care)")
     args = ap.parse_args()
 
     sessions = find_sessions(args.days, args.exclude)[: args.max]
@@ -140,7 +146,7 @@ def main():
             continue
         print(f"opening {s['cwd']}  (session {s['id'][:8]}…)")
         try:
-            open_in_terminal(s["cwd"], s["id"])
+            open_in_terminal(s["cwd"], s["id"], crazy=args.crazy)
         except subprocess.CalledProcessError as e:
             print(f"  failed: {e.stderr.decode(errors='replace').strip()}")
             sys.exit(1)

@@ -69,6 +69,9 @@ claude-recover --days 2       # only look at the last 2 days
 claude-recover --max 20       # list up to 20 sessions
 claude-recover --exclude ID   # skip a session (id prefix ok, repeatable),
                               #   e.g. the one you're currently sitting in
+claude-recover --crazy 3      # reopen with --dangerously-skip-permissions
+                              #   (skips ALL permission prompts — only for
+                              #   sessions/folders you fully trust)
 ```
 
 Inside Claude Code (with the skill installed):
