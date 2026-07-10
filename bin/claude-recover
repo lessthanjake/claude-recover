@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""claude-recover — list recent Claude Code sessions and reopen them in new terminal windows.
+
+Usage:
+  claude-recover              List the 10 most recent sessions (last 7 days)
+  claude-recover 3            List, then reopen the top 3 in new terminal windows
+  claude-recover --days 2 3   Only consider sessions from the last 2 days
+  claude-recover --exclude ID Skip a session (id prefix ok, repeatable) — e.g. the
+                              session you're currently in
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+
+def first_user_snippet(path, limit=90):
+    """First real user message in a transcript, skipping harness/command noise."""
+    try:
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("type") != "user":
+                    continue
+                m = (d.get("message") or {}).get("content")
+                text = None
+                if isinstance(m, str):
+                    text = m
+                elif isinstance(m, list):
+                    for c in m:
+                        if isinstance(c, dict) and c.get("type") == "text":
+                            text = c.get("text")
+                            break
+                if not text:
+                    continue
+                if text.lstrip().startswith(("<local-command", "<command", "<system-reminder")):
+                    continue
+                snippet = " ".join(text.split())
+                return snippet[:limit] + ("…" if len(snippet) > limit else "")
+    except OSError:
+        pass
+    return "(no readable prompt)"
+
+
+def session_cwd(path):
+    """Working directory, read from the transcript's own cwd field (reliable,
+    unlike decoding the folder name, which is ambiguous for dashed paths)."""
+    try:
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("cwd"):
+                    return d["cwd"]
+    except OSError:
+        pass
+    return None
+
+
+def find_sessions(days, excludes):
+    cutoff = time.time() - days * 86400
+    sessions = []
+    for f in PROJECTS_DIR.glob("*/*.jsonl"):
+        sid = f.stem
+        if any(sid.startswith(e) for e in excludes):
+            continue
+        mtime = f.stat().st_mtime
+        if mtime < cutoff:
+            continue
+        sessions.append({"file": f, "id": sid, "mtime": mtime})
+    sessions.sort(key=lambda s: s["mtime"], reverse=True)
+    for s in sessions:
+        s["cwd"] = session_cwd(s["file"])
+        s["snippet"] = first_user_snippet(s["file"])
+    return sessions
+
+
+def open_in_terminal(cwd, session_id):
+    cmd = f"cd {json.dumps(cwd)} && claude --resume {session_id}"
+    if os.environ.get("TERM_PROGRAM") == "iTerm.app" or Path("/Applications/iTerm.app").exists():
+        script = f'''
+        tell application "iTerm"
+            activate
+            set newWindow to (create window with default profile)
+            tell current session of newWindow to write text {json.dumps(cmd)}
+        end tell'''
+    else:
+        script = f'''
+        tell application "Terminal"
+            activate
+            do script {json.dumps(cmd)}
+        end tell'''
+    subprocess.run(["osascript", "-e", script], check=True, capture_output=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="List and reopen recent Claude Code sessions.")
+    ap.add_argument("count", nargs="?", type=int, default=0,
+                    help="reopen the top N sessions in new terminal windows")
+    ap.add_argument("--days", type=float, default=7, help="lookback window (default 7)")
+    ap.add_argument("--exclude", action="append", default=[], metavar="ID",
+                    help="session id (prefix ok) to skip; repeatable")
+    ap.add_argument("--max", type=int, default=10, help="max sessions to list (default 10)")
+    args = ap.parse_args()
+
+    sessions = find_sessions(args.days, args.exclude)[: args.max]
+    if not sessions:
+        print(f"No sessions found in the last {args.days:g} day(s).")
+        return
+
+    home = str(Path.home())
+    for i, s in enumerate(sessions, 1):
+        when = datetime.fromtimestamp(s["mtime"]).strftime("%b %d %I:%M %p")
+        cwd = s["cwd"] or "(unknown cwd)"
+        disp = "~" + cwd[len(home):] if cwd.startswith(home) else cwd
+        missing = "" if (s["cwd"] and Path(s["cwd"]).is_dir()) else "  [folder missing!]"
+        print(f"{i:2}. {when}  {disp}{missing}")
+        print(f"    {s['snippet']}")
+        print(f"    id: {s['id']}")
+
+    if args.count <= 0:
+        return
+
+    print()
+    for s in sessions[: args.count]:
+        if not (s["cwd"] and Path(s["cwd"]).is_dir()):
+            print(f"skipping {s['id'][:8]} — working folder missing: {s['cwd']}")
+            continue
+        print(f"opening {s['cwd']}  (session {s['id'][:8]}…)")
+        try:
+            open_in_terminal(s["cwd"], s["id"])
+        except subprocess.CalledProcessError as e:
+            print(f"  failed: {e.stderr.decode(errors='replace').strip()}")
+            sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
