@@ -1,44 +1,45 @@
 ---
 name: recover-sessions
-description: After a crash or accidental terminal close, list recent Claude Code sessions and reopen the top N in new terminal windows, each resumed in its correct working folder. Use when the user says their computer/terminal crashed and they want their sessions back.
+description: After a crash or accidental terminal close, reopen the Claude Code sessions that were active, each resumed in its correct working folder as a tab in one iTerm2 window. Use when the user says their computer/terminal crashed and they want their sessions back.
 ---
 
 Recover recent Claude Code sessions using the `claude-recover` CLI (installed at
-`~/.local/bin/claude-recover`).
+`~/.local/bin/claude-recover`). The CLI is deterministic and does the whole job
+itself; your role is to run it and relay the result.
 
 ## Steps
 
-1. Determine the current session's ID so it isn't offered for reopening — it is the
-   UUID in this session's scratchpad directory path.
-
-2. List recent sessions:
+1. Preview what it would do:
 
    ```bash
-   claude-recover --exclude <current-session-id>
+   claude-recover --auto -n
    ```
 
-   Useful flags: `--days N` to narrow the window (default 7), `--max N` for list length.
+   `--auto` finds the most recent burst of activity (sessions with no silence longer
+   than 120 minutes between them, tunable with `--gap MIN`) and selects every session
+   in it that is not already running, is not the current session (it reads
+   `CLAUDE_CODE_SESSION_ID`), and whose working folder still exists.
 
-3. Show the user the list (last active, working folder, what the session was about).
-   If the user already said how many to reopen (e.g. "the top three"), skip the ask.
-   Otherwise ask which ones they want reopened.
-
-4. Reopen the top N (opens one new terminal window per session — iTerm2 if present,
-   otherwise Terminal.app — cd'd into the right folder, running `claude --resume <id>`):
+2. If the preview matches what the user described, reopen them:
 
    ```bash
-   claude-recover --exclude <current-session-id> N
+   claude-recover --auto
    ```
 
-   To reopen a non-contiguous selection (e.g. #2 and #4 only), run a resume command
-   per session in a new terminal window instead:
+   Sessions open as tabs in one new iTerm2 window (Terminal.app falls back to one
+   window each). Pass `--windows` if the user wants separate windows.
+
+3. If `--auto` reports "nothing to reopen" (e.g. the crash was hours ago and a
+   newer session has since been started), show the plain list and let the user
+   pick a count:
 
    ```bash
-   osascript -e 'tell application "iTerm"
-     activate
-     tell current session of (create window with default profile) to write text "cd <folder> && claude --resume <session-id>"
-   end tell'
+   claude-recover              # list
+   claude-recover N            # reopen the top N (still skips running/current)
    ```
 
-5. Report which sessions were reopened. If a session's working folder no longer
-   exists, the script skips it and says so — surface that to the user.
+   For a non-contiguous selection, `--exclude ID` (prefix ok, repeatable) removes
+   entries before counting.
+
+4. Report which sessions were reopened and which were skipped (already running,
+   folder missing). The CLI prints both.

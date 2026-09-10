@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""claude-recover — list recent Claude Code sessions and reopen them in new terminal windows.
+"""claude-recover — list recent Claude Code sessions and reopen them after a crash.
 
 Usage:
   claude-recover              List the 10 most recent sessions (last 7 days)
-  claude-recover 3            List, then reopen the top 3 in new terminal windows
+  claude-recover --auto       Reopen every session in the most recent burst of
+                              activity that isn't already running (deterministic;
+                              no judgement calls). Add -n to preview.
+  claude-recover 3            Reopen the top 3 sessions
   claude-recover --days 2 3   Only consider sessions from the last 2 days
-  claude-recover --exclude ID Skip a session (id prefix ok, repeatable) — e.g. the
-                              session you're currently in
+  claude-recover --exclude ID Skip a session (id prefix ok, repeatable). The session
+                              you're currently in (CLAUDE_CODE_SESSION_ID) and
+                              sessions already running are skipped automatically.
+  claude-recover --windows 3  One terminal window per session instead of one
+                              iTerm2 window with a tab per session
   claude-recover --crazy 3    Reopen with --dangerously-skip-permissions (no
                               permission prompts — use with care)
 """
@@ -71,85 +77,230 @@ def session_cwd(path):
     return None
 
 
-def find_sessions(days, excludes):
+def find_sessions(days):
     cutoff = time.time() - days * 86400
     sessions = []
     for f in PROJECTS_DIR.glob("*/*.jsonl"):
-        sid = f.stem
-        if any(sid.startswith(e) for e in excludes):
-            continue
         mtime = f.stat().st_mtime
         if mtime < cutoff:
             continue
-        sessions.append({"file": f, "id": sid, "mtime": mtime})
+        sessions.append({"file": f, "id": f.stem, "mtime": mtime})
     sessions.sort(key=lambda s: s["mtime"], reverse=True)
     for s in sessions:
         s["cwd"] = session_cwd(s["file"])
         s["snippet"] = first_user_snippet(s["file"])
+        s["has_dir"] = bool(s["cwd"]) and Path(s["cwd"]).is_dir()
     return sessions
 
 
-def open_in_terminal(cwd, session_id, crazy=False):
+def running_claude_processes():
+    """Live `claude` CLI processes: list of (resume_id_or_None, cwd_or_None).
+
+    A process started with `claude --resume ID` tells us its session directly.
+    A plain `claude` only tells us its working directory, so callers treat the
+    most recently active session in that directory as the running one.
+    """
+    procs = []
+    try:
+        out = subprocess.run(["ps", "-eo", "pid=,command="], capture_output=True,
+                             text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return procs
+    me = os.getpid()
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        pid, cmd = parts
+        argv = cmd.split()
+        if not argv or os.path.basename(argv[0]) != "claude" or int(pid) == me:
+            continue
+        resume_id = None
+        for i, a in enumerate(argv[1:-1], 1):
+            if a in ("--resume", "-r"):
+                resume_id = argv[i + 1]
+                break
+        procs.append({"pid": int(pid), "resume_id": resume_id, "cwd": None})
+    if not procs:
+        return procs
+    pids = ",".join(str(p["pid"]) for p in procs)
+    try:
+        out = subprocess.run(["lsof", "-a", "-d", "cwd", "-p", pids, "-Fn"],
+                             capture_output=True, text=True).stdout
+    except OSError:
+        return procs
+    by_pid = {p["pid"]: p for p in procs}
+    cur = None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            cur = by_pid.get(int(line[1:]))
+        elif line.startswith("n") and cur is not None:
+            cur["cwd"] = line[1:]
+    return procs
+
+
+def mark_running(sessions):
+    """Set s['running'] on sessions that a live claude process appears to own."""
+    procs = running_claude_processes()
+    running_ids = {p["resume_id"] for p in procs if p["resume_id"]}
+    plain_cwds = {p["cwd"] for p in procs if not p["resume_id"] and p["cwd"]}
+    for s in sessions:
+        s["running"] = any(s["id"].startswith(r) or r.startswith(s["id"]) for r in running_ids)
+    # A bare `claude` in a folder is most plausibly the newest session there.
+    for cwd in plain_cwds:
+        for s in sessions:  # already sorted newest-first
+            if s["cwd"] == cwd and not s["running"]:
+                s["running"] = True
+                break
+
+
+def crash_cluster(sessions, gap_minutes):
+    """Sessions in the most recent burst of activity: walking from the newest
+    session downwards, stop at the first silence longer than gap_minutes."""
+    cluster = []
+    for s in sessions:
+        if cluster and (cluster[-1]["mtime"] - s["mtime"]) > gap_minutes * 60:
+            break
+        cluster.append(s)
+    return cluster
+
+
+def resume_command(s, crazy):
     flags = "--dangerously-skip-permissions " if crazy else ""
-    cmd = f"cd {json.dumps(cwd)} && claude {flags}--resume {session_id}"
-    if os.environ.get("TERM_PROGRAM") == "iTerm.app" or Path("/Applications/iTerm.app").exists():
-        script = f'''
-        tell application "iTerm"
-            activate
-            set newWindow to (create window with default profile)
-            tell current session of newWindow to write text {json.dumps(cmd)}
-        end tell'''
+    return f"cd {json.dumps(s['cwd'])} && claude {flags}--resume {s['id']}"
+
+
+def have_iterm():
+    return os.environ.get("TERM_PROGRAM") == "iTerm.app" or Path("/Applications/iTerm.app").exists()
+
+
+def open_sessions(sessions, crazy=False, windows=False):
+    """Open each session in a terminal. iTerm2: one window, one tab per session
+    (or one window each with windows=True). Terminal.app: always one window each,
+    since it has no scriptable way to add a tab."""
+    if not sessions:
+        return
+    if have_iterm():
+        lines = ['tell application "iTerm"', "    activate"]
+        for i, s in enumerate(sessions):
+            cmd = json.dumps(resume_command(s, crazy))
+            title = json.dumps(os.path.basename(s["cwd"].rstrip("/")) or s["cwd"])
+            if i == 0 or windows:
+                lines.append("    set w to (create window with default profile)")
+                lines.append("    tell current session of w")
+            else:
+                lines.append("    tell w to set t to (create tab with default profile)")
+                lines.append("    tell current session of t")
+            lines += [f"        write text {cmd}", f"        set name to {title}", "    end tell"]
+        lines.append("end tell")
     else:
-        script = f'''
-        tell application "Terminal"
-            activate
-            do script {json.dumps(cmd)}
-        end tell'''
-    subprocess.run(["osascript", "-e", script], check=True, capture_output=True)
+        lines = ['tell application "Terminal"', "    activate"]
+        for s in sessions:
+            lines.append(f"    do script {json.dumps(resume_command(s, crazy))}")
+        lines.append("end tell")
+    subprocess.run(["osascript", "-e", "\n".join(lines)], check=True, capture_output=True)
 
 
 def main():
     ap = argparse.ArgumentParser(description="List and reopen recent Claude Code sessions.")
     ap.add_argument("count", nargs="?", type=int, default=0,
-                    help="reopen the top N sessions in new terminal windows")
+                    help="reopen the top N sessions")
+    ap.add_argument("--auto", action="store_true",
+                    help="reopen every session in the most recent burst of activity "
+                         "that isn't already running (see --gap)")
+    ap.add_argument("--gap", type=float, default=120, metavar="MIN",
+                    help="for --auto: a silence longer than this many minutes ends "
+                         "the burst (default 120)")
+    ap.add_argument("-n", "--dry-run", action="store_true",
+                    help="show what would be opened without opening anything")
     ap.add_argument("--days", type=float, default=7, help="lookback window (default 7)")
     ap.add_argument("--exclude", action="append", default=[], metavar="ID",
                     help="session id (prefix ok) to skip; repeatable")
     ap.add_argument("--max", type=int, default=10, help="max sessions to list (default 10)")
+    ap.add_argument("--windows", action="store_true",
+                    help="one terminal window per session instead of tabs in one window")
     ap.add_argument("--crazy", action="store_true",
                     help="resume with --dangerously-skip-permissions "
                          "(no permission prompts — use with care)")
     args = ap.parse_args()
 
-    sessions = find_sessions(args.days, args.exclude)[: args.max]
-    if not sessions:
+    excludes = list(args.exclude)
+    current = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if current:
+        excludes.append(current)
+
+    sessions = find_sessions(args.days)
+    mark_running(sessions)
+    for s in sessions:
+        s["excluded"] = any(s["id"].startswith(e) for e in excludes)
+        s["current"] = bool(current) and s["id"] == current
+
+    if args.auto:
+        cluster = crash_cluster(sessions, args.gap)
+        shown = cluster
+    else:
+        shown = [s for s in sessions if not s["excluded"]][: args.max]
+        cluster = []
+
+    if not shown:
         print(f"No sessions found in the last {args.days:g} day(s).")
         return
 
     home = str(Path.home())
-    for i, s in enumerate(sessions, 1):
+    for i, s in enumerate(shown, 1):
         when = datetime.fromtimestamp(s["mtime"]).strftime("%b %d %I:%M %p")
         cwd = s["cwd"] or "(unknown cwd)"
         disp = "~" + cwd[len(home):] if cwd.startswith(home) else cwd
-        missing = "" if (s["cwd"] and Path(s["cwd"]).is_dir()) else "  [folder missing!]"
-        print(f"{i:2}. {when}  {disp}{missing}")
+        tags = []
+        if not s["has_dir"]:
+            tags.append("folder missing!")
+        if s["current"]:
+            tags.append("this session")
+        elif s["running"]:
+            tags.append("already running")
+        elif s["excluded"]:
+            tags.append("excluded")
+        tag = f"  [{', '.join(tags)}]" if tags else ""
+        print(f"{i:2}. {when}  {disp}{tag}")
         print(f"    {s['snippet']}")
         print(f"    id: {s['id']}")
 
-    if args.count <= 0:
-        return
+    if args.auto:
+        to_open = [s for s in cluster
+                   if s["has_dir"] and not (s["running"] or s["excluded"])]
+        print()
+        print(f"burst: {len(cluster)} session(s) with no gap over {args.gap:g} min; "
+              f"{len(cluster) - len(to_open)} skipped (running/excluded/missing folder)")
+        if not to_open:
+            print("nothing to reopen. If the crash was a while ago, try --gap or an explicit count.")
+            return
+    else:
+        if args.count <= 0:
+            return
+        to_open = []
+        for s in shown[: args.count]:
+            if not s["has_dir"]:
+                print(f"skipping {s['id'][:8]} — working folder missing: {s['cwd']}")
+            elif s["running"]:
+                print(f"skipping {s['id'][:8]} — already running in {s['cwd']}")
+            else:
+                to_open.append(s)
+        print()
 
-    print()
-    for s in sessions[: args.count]:
-        if not (s["cwd"] and Path(s["cwd"]).is_dir()):
-            print(f"skipping {s['id'][:8]} — working folder missing: {s['cwd']}")
-            continue
-        print(f"opening {s['cwd']}  (session {s['id'][:8]}…)")
-        try:
-            open_in_terminal(s["cwd"], s["id"], crazy=args.crazy)
-        except subprocess.CalledProcessError as e:
-            print(f"  failed: {e.stderr.decode(errors='replace').strip()}")
-            sys.exit(1)
+    verb = "would open" if args.dry_run else "opening"
+    layout = "one window each" if (args.windows or not have_iterm()) else "tabs in one iTerm2 window"
+    for s in to_open:
+        print(f"{verb} {s['cwd']}  (session {s['id'][:8]}…)")
+    if not to_open:
+        return
+    print(f"({len(to_open)} session(s), {layout})")
+    if args.dry_run:
+        return
+    try:
+        open_sessions(to_open, crazy=args.crazy, windows=args.windows)
+    except subprocess.CalledProcessError as e:
+        print(f"  failed: {e.stderr.decode(errors='replace').strip()}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

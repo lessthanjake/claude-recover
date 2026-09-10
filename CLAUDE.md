@@ -28,11 +28,13 @@ No test suite. Sanity-check changes with:
 
 ```bash
 python3 bin/claude-recover            # list mode — safe, read-only
+python3 bin/claude-recover --auto -n  # what --auto would reopen, without opening
 python3 bin/claude-recover --days 1   # narrower window
 ```
 
-Only pass a count (e.g. `claude-recover 2`) if you actually intend to open
-terminal windows on the user's machine.
+Only pass a count (e.g. `claude-recover 2`) or `--auto` without `-n` if you actually
+intend to open terminal tabs on the user's machine. The script reads
+`CLAUDE_CODE_SESSION_ID` and `ps` to skip the current and already-running sessions.
 
 ## Syncing
 
