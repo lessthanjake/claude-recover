@@ -11,6 +11,8 @@ Usage:
   claude-recover --exclude ID Skip a session (id prefix ok, repeatable). The session
                               you're currently in (CLAUDE_CODE_SESSION_ID) and
                               sessions already running are skipped automatically.
+  claude-recover --headless   Include headless `claude -p` / SDK sessions, which
+                              are hidden by default (they can't be resumed usefully)
   claude-recover --windows 3  One terminal window per session instead of one
                               iTerm2 window with a tab per session
   claude-recover --crazy 3    Reopen with --dangerously-skip-permissions (no
@@ -60,9 +62,11 @@ def first_user_snippet(path, limit=90):
     return "(no readable prompt)"
 
 
-def session_cwd(path):
-    """Working directory, read from the transcript's own cwd field (reliable,
-    unlike decoding the folder name, which is ambiguous for dashed paths)."""
+def session_meta(path):
+    """(cwd, entrypoint) from the transcript itself. cwd is reliable, unlike
+    decoding the folder name, which is ambiguous for dashed paths. entrypoint
+    is "cli" for interactive sessions and "sdk-*" for headless `claude -p` runs."""
+    cwd = entrypoint = None
     try:
         with open(path, errors="replace") as fh:
             for line in fh:
@@ -70,11 +74,15 @@ def session_cwd(path):
                     d = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if d.get("cwd"):
-                    return d["cwd"]
+                if not isinstance(d, dict):
+                    continue
+                cwd = cwd or d.get("cwd")
+                entrypoint = entrypoint or d.get("entrypoint")
+                if cwd and entrypoint:
+                    break
     except OSError:
         pass
-    return None
+    return cwd, entrypoint
 
 
 def find_sessions(days):
@@ -87,7 +95,8 @@ def find_sessions(days):
         sessions.append({"file": f, "id": f.stem, "mtime": mtime})
     sessions.sort(key=lambda s: s["mtime"], reverse=True)
     for s in sessions:
-        s["cwd"] = session_cwd(s["file"])
+        s["cwd"], entrypoint = session_meta(s["file"])
+        s["headless"] = bool(entrypoint) and entrypoint.startswith("sdk")
         s["snippet"] = first_user_snippet(s["file"])
         s["has_dir"] = bool(s["cwd"]) and Path(s["cwd"]).is_dir()
     return sessions
@@ -156,9 +165,14 @@ def mark_running(sessions):
 
 def crash_cluster(sessions, gap_minutes):
     """Sessions in the most recent burst of activity: walking from the newest
-    session downwards, stop at the first silence longer than gap_minutes."""
+    session downwards, stop at the first silence longer than gap_minutes.
+
+    Running and excluded sessions are ignored, so activity after the crash
+    (this session, sessions already reopened) doesn't anchor the burst."""
     cluster = []
     for s in sessions:
+        if s["running"] or s["excluded"]:
+            continue
         if cluster and (cluster[-1]["mtime"] - s["mtime"]) > gap_minutes * 60:
             break
         cluster.append(s)
@@ -217,6 +231,8 @@ def main():
     ap.add_argument("--exclude", action="append", default=[], metavar="ID",
                     help="session id (prefix ok) to skip; repeatable")
     ap.add_argument("--max", type=int, default=10, help="max sessions to list (default 10)")
+    ap.add_argument("--headless", action="store_true",
+                    help="include headless `claude -p` / SDK sessions (hidden by default)")
     ap.add_argument("--windows", action="store_true",
                     help="one terminal window per session instead of tabs in one window")
     ap.add_argument("--crazy", action="store_true",
@@ -230,6 +246,10 @@ def main():
         excludes.append(current)
 
     sessions = find_sessions(args.days)
+    hidden = 0
+    if not args.headless:
+        hidden = sum(s["headless"] for s in sessions)
+        sessions = [s for s in sessions if not s["headless"]]
     mark_running(sessions)
     for s in sessions:
         s["excluded"] = any(s["id"].startswith(e) for e in excludes)
@@ -242,6 +262,8 @@ def main():
         shown = [s for s in sessions if not s["excluded"]][: args.max]
         cluster = []
 
+    if hidden:
+        print(f"({hidden} headless session(s) hidden; --headless to include)")
     if not shown:
         print(f"No sessions found in the last {args.days:g} day(s).")
         return
@@ -266,11 +288,11 @@ def main():
         print(f"    id: {s['id']}")
 
     if args.auto:
-        to_open = [s for s in cluster
-                   if s["has_dir"] and not (s["running"] or s["excluded"])]
+        to_open = [s for s in cluster if s["has_dir"]]
         print()
-        print(f"burst: {len(cluster)} session(s) with no gap over {args.gap:g} min; "
-              f"{len(cluster) - len(to_open)} skipped (running/excluded/missing folder)")
+        print(f"burst: {len(cluster)} session(s) with no gap over {args.gap:g} min "
+              f"(running and excluded sessions ignored); "
+              f"{len(cluster) - len(to_open)} skipped (missing folder)")
         if not to_open:
             print("nothing to reopen. If the crash was a while ago, try --gap or an explicit count.")
             return

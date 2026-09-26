@@ -39,19 +39,26 @@ folder no longer exists are skipped with a warning.
 `--auto` picks the sessions for you, with no judgement calls, so it's safe to run
 from a shell alias or a fresh terminal right after a crash:
 
-1. Take the most recent session and walk backwards in time while the silence
+1. Set aside sessions that can't be what you lost: anything already running (it
+   checks `ps` for `claude --resume <id>` and for bare `claude` processes by working
+   directory), the session you're typing in (`CLAUDE_CODE_SESSION_ID`), anything
+   passed with `--exclude`, and headless `claude -p` / SDK runs (see below).
+2. From the most recent remaining session, walk backwards in time while the silence
    between consecutive sessions is under `--gap` minutes (default 120). That burst
    is what was active when things died.
-2. Drop anything already running (it checks `ps` for `claude --resume <id>` and for
-   bare `claude` processes by working directory), the session you're typing in
-   (`CLAUDE_CODE_SESSION_ID`), anything passed with `--exclude`, and sessions whose
-   folder is gone.
-3. Reopen the rest. `-n` / `--dry-run` shows the plan without opening anything.
+3. Reopen it, minus sessions whose folder is gone. `-n` / `--dry-run` shows the
+   plan without opening anything.
 
-Running it twice is harmless: the second run finds everything already running and
-opens nothing. If the crash was long enough ago that a newer session has started
-since, the burst may contain only that newer session; widen `--gap` or fall back
-to an explicit count.
+Because step 1 happens before the burst is measured, work you started after
+rebooting doesn't hide the crash burst, and running it twice is harmless: the
+second run skips everything it already reopened and finds nothing new.
+
+### Headless sessions
+
+Scripts, cron jobs, and agents that call `claude -p` write transcripts too
+(marked `"entrypoint": "sdk-cli"`). They aren't sessions you had open, so they're
+hidden from the list and from `--auto`; the list prints how many were hidden.
+Pass `--headless` to include them.
 
 ## Requirements
 
@@ -88,6 +95,7 @@ claude-recover --auto -n      # ...but only show what would be opened
 claude-recover --gap 30 --auto  # a 30-minute silence ends the burst
 claude-recover 3              # list, then reopen the top 3
 claude-recover --windows 3    # one window per session instead of tabs
+claude-recover --headless     # include headless `claude -p` / SDK sessions
 claude-recover --days 2       # only look at the last 2 days
 claude-recover --max 20       # list up to 20 sessions
 claude-recover --exclude ID   # skip a session (id prefix ok, repeatable);

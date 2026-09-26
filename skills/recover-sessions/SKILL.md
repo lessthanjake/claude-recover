@@ -15,10 +15,12 @@ itself; your role is to run it and relay the result.
    claude-recover --auto -n
    ```
 
-   `--auto` finds the most recent burst of activity (sessions with no silence longer
-   than 120 minutes between them, tunable with `--gap MIN`) and selects every session
-   in it that is not already running, is not the current session (it reads
-   `CLAUDE_CODE_SESSION_ID`), and whose working folder still exists.
+   `--auto` first sets aside sessions that are already running, the current session
+   (it reads `CLAUDE_CODE_SESSION_ID`), and headless `claude -p` / SDK runs. From the
+   rest it takes the most recent burst of activity (no silence longer than 120
+   minutes between sessions, tunable with `--gap MIN`) and selects every session in
+   it whose working folder still exists. Post-crash activity therefore doesn't hide
+   the crash burst.
 
 2. If the preview matches what the user described, reopen them:
 
@@ -29,9 +31,8 @@ itself; your role is to run it and relay the result.
    Sessions open as tabs in one new iTerm2 window (Terminal.app falls back to one
    window each). Pass `--windows` if the user wants separate windows.
 
-3. If `--auto` reports "nothing to reopen" (e.g. the crash was hours ago and a
-   newer session has since been started), show the plain list and let the user
-   pick a count:
+3. If `--auto` picks the wrong burst (e.g. the user closed some sessions cleanly
+   after the crash), show the plain list and let the user pick a count:
 
    ```bash
    claude-recover              # list
